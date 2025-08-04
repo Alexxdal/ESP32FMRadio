@@ -34,7 +34,7 @@
 #include "rickroll.h"
 
 #define FM_CARRIER_HZ   100000000UL     // FM Carrier Frequency
-#define MAX_DEV_HZ      62000UL        // ±75 kHz standard broadcast
+#define MAX_DEV_HZ      75000UL        // ±75 kHz standard broadcast
 #define WAV_SR_HZ       8000           // Sample Rate (8 kHz)
 
 #if !CONFIG_IDF_TARGET_ESP32
@@ -46,19 +46,6 @@ static fm_apll_cfg_t fm_calc_apll(uint32_t fout_hz, uint32_t dev_hz);
 
 static fm_apll_cfg_t g_apll;
 
-// void fm_apll_on(void)
-// {
-//     /*  XTAL = 40 MHz
-//         Fout = XTAL · (4 + sdm2 + sdm1/256 + sdm0/65536) / [ 2 · (o_div+2) ]
-//         Vogliamo Fout = 100 MHz  ⇒  scegliamo:
-//         o_div = 0   (denominatore = 4)
-//         sdm2 = 6    (4+sdm2 = 10  →  40·10 / 4 = 100 MHz esatti)
-//         sdm1 = sdm0 = 0
-//     */
-//     rtc_clk_apll_enable(true);
-//     rtc_clk_apll_coeff_set(0, 0, 0, 6);
-// }
-
 static inline uint32_t get_xtal_hz(void)
 {
     return rtc_clk_xtal_freq_get() * 1000000UL;
@@ -68,61 +55,78 @@ void fm_apll_init(void)
 {
     g_apll = fm_calc_apll(FM_CARRIER_HZ, MAX_DEV_HZ);
 
+    uint8_t sdm0 = g_apll.base_frac16 & 0xFF;
+    uint8_t sdm1 = g_apll.base_frac16 >> 8;
     rtc_clk_apll_enable(true);
-    rtc_clk_apll_coeff_set(g_apll.o_div,
-                           g_apll.base_sdm0,
-                           g_apll.sdm1,
-                           g_apll.sdm2);
+    rtc_clk_apll_coeff_set(g_apll.o_div, sdm0, sdm1, g_apll.sdm2);
 
-    /* Audio a 8 bit unsigned → max ampiezza = 127 */
-    g_apll.g_mod_shift = 7;                      // 2^7 = 128 ≈ 127
-    g_apll.g_mod_mul = g_apll.dev_lsb; //* 3 / 4;         // dev_lsb * 1   (dividerai dopo con >>7)
-                        
-    ESP_LOGI("FM",
-            "o_div=%u  sdm2=%u  sdm1=%u  base=%u  dev=%u",
-            g_apll.o_div,
-            g_apll.sdm2,
-            g_apll.sdm1,
-            g_apll.base_sdm0,
-            g_apll.dev_lsb);
+    ESP_LOGI("FM", "o_div=%u  sdm2=%u  frac=0x%04X  dev=%u LSB",
+             g_apll.o_div, g_apll.sdm2, g_apll.base_frac16, g_apll.dev_frac16);
 }
 
 static fm_apll_cfg_t fm_calc_apll(uint32_t fout_hz, uint32_t dev_hz)
 {
     uint32_t XTAL = get_xtal_hz();
     fm_apll_cfg_t c = {0};
-    /* 1) trova il più piccolo o_div che rispetta il lock 350-500 MHz */
+    /* 1) choose o_div so VCO ≥350 MHz */
     while (c.o_div < 31) {
-        if (fout_hz * 2 * (c.o_div + 2) >= 350000000UL) break;     // 350 MHz min lock
+        if (fout_hz * 2 * (c.o_div + 2) >= 350000000UL) break;
         ++c.o_div;
     }
+    /* 2) numerator  (4 + sdm2 + frac16/65536) */
+    double mul   = (double)fout_hz * 2 * (c.o_div + 2) / XTAL;
+    c.sdm2       = (uint8_t)mul - 4;           // integer part
+    double frac  = mul - (c.sdm2 + 4);         // 0…<1
+    uint32_t f16 = lround(frac * 65536.0);     // 0…65535
 
-    /* 2) fattore di moltiplica totale */
-    double factor = (double)fout_hz * 2 * (c.o_div + 2) / XTAL;
-    c.sdm2       = (uint8_t)factor - 4;
-    double frac  = factor - (c.sdm2 + 4);
-    c.sdm1       = (uint8_t)(frac * 256);
-    c.base_sdm0  = (uint16_t)((frac * 256 - c.sdm1) * 65536);
+    if (f16 == 65536) {        // handle round-up overflow
+        f16 = 0;
+        ++c.sdm2;
+    }
+    c.base_frac16 = (uint16_t)f16;
 
-    /* 3) quanti LSB valgono 1 Hz a questo o_div */
+    /* keep at least ±dev_frac16 margin */
+    if (c.base_frac16 < c.dev_frac16)
+        c.base_frac16 += c.dev_frac16;
+    else if (c.base_frac16 > 65535 - c.dev_frac16)
+        c.base_frac16 -= c.dev_frac16;
+
+    /* 3) how many fraction-LSB for 1 Hz at this o_div */
     double lsb_hz = XTAL / (2.0 * (c.o_div + 2) * 65536);
-    c.dev_lsb    = (uint16_t)round(dev_hz / lsb_hz);           // → DEV_LSB automatico
+    c.dev_frac16  = (uint16_t)lround(dev_hz / lsb_hz);
 
-    /* 4) se la frazione è troppo piccola, spostati al centro ±dev_lsb */
-    if (c.base_sdm0 < c.dev_lsb)              // tipico con portanti 87-108 MHz
-        c.base_sdm0 += c.dev_lsb;             //  → sdoppiamento simmetrico
-
-    c.is_rev0   = (efuse_ll_get_chip_ver_rev1() == 0);
+    c.is_rev0 = (efuse_ll_get_chip_ver_rev1() == 0);
     return c;
 }
 
-static inline void fm_set_deviation(int16_t delta_lsb)
+static inline void fm_set_deviation(int16_t delta_frac16)
 {
-    int32_t sdm0 = (int32_t)g_apll.base_sdm0 + delta_lsb;
-    if (sdm0 < 0)       sdm0 = 0;
-    if (sdm0 > 65535)   sdm0 = 65535;
+    int32_t frac32 = (int32_t)g_apll.base_frac16 + delta_frac16;
+    int32_t sdm2   = g_apll.sdm2;          // work copy
 
-    clk_ll_apll_set_config(g_apll.is_rev0, g_apll.o_div, (uint16_t)sdm0, g_apll.sdm1, g_apll.sdm2);
+    /* borrow / carry across the 16-bit fraction */
+    if (frac32 < 0) {
+        int32_t borrow = (-frac32 + 65535) >> 16;  // how many 65536 steps
+        frac32 += borrow * 65536;
+        sdm2   -= borrow;
+    } else if (frac32 > 65535) {
+        int32_t carry = frac32 >> 16;              // how many 65536 steps
+        frac32 -= carry * 65536;
+        sdm2   += carry;
+    }
+
+    /* clamp sdm2 to valid 0…63 just in case */
+    if (sdm2 < 0)      { sdm2 = 0;      frac32 = 0;      }
+    if (sdm2 > 63)     { sdm2 = 63;     frac32 = 65535;  }
+
+    uint8_t sdm0 = frac32 & 0xFF;
+    uint8_t sdm1 = frac32 >> 8;
+
+    clk_ll_apll_set_config(g_apll.is_rev0,
+                           g_apll.o_div,
+                           sdm0,
+                           sdm1,
+                           (uint8_t)sdm2);
 }
 
 void fm_route_to_pin(void)
@@ -150,29 +154,22 @@ void fm_i2s_init(void)
     ESP_ERROR_CHECK(i2s_start(I2S_NUM_0));
 }
 
-static void IRAM_ATTR fm_timer_cb(void *arg)
-{
-    static size_t pos;
-    int16_t delta = (((rickroll[pos++] - 128) * g_apll.dev_lsb) >> 7);
-    fm_set_deviation((int16_t)delta);
-    if (pos >= rickroll_len) pos = 0;
+static inline int16_t clip16(int32_t v){
+    if (v >  2047) v = 2047 + ((v-2047)>>2);
+    if (v < -2047) v = -2047 + ((v+2047)>>2);
+    return (int16_t)v;
 }
 
-
-// static void IRAM_ATTR fm_timer_cb(void *arg)
-// {
-//     static size_t  pos = 0;
-//     uint8_t pcm8 = rickroll[pos];
-//     if (++pos >= rickroll_len) pos = 0;
-
-//     static int16_t y_prev = 0;
-//     int16_t x = (int16_t)pcm8 - 128;
-//     int16_t y = x + ((y_prev * 225) >> 8);
-//     y_prev = y;
-
-//     int16_t delta = (y * g_apll.dev_lsb) >> 7;
-//     fm_set_deviation(delta);
-// }
+static void IRAM_ATTR fm_timer_cb(void *arg)
+{
+    static size_t  pos      = 0;
+    /* 1. Leggi campione 8-bit e portalo a signed */
+    int16_t audio = (int16_t)rickroll[pos++] - 128;   // –128 … +127
+    if (pos >= rickroll_len) pos = 0;
+    /* 3. Scala in frazione APLL e applica deviazione */
+    int16_t delta = (audio * g_apll.dev_frac16) >> 7;      // scale
+    fm_set_deviation(delta);
+}
 
 void fm_start_audio(void)
 {

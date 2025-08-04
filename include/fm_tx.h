@@ -2,11 +2,9 @@
 #define FM_TX_H
 
 typedef struct {
-    uint8_t  o_div, sdm1, sdm2;
-    uint16_t base_sdm0;         // “centro” da cui si parte
-    uint16_t dev_lsb;           // quanti LSB servono per ±MAX_DEV_HZ
-    uint16_t g_mod_mul;         // moltiplicatore per la modulazione
-    uint8_t  g_mod_shift;       // = 0 se usi divisione intera
+    uint8_t  o_div, sdm2;      // integer part
+    uint16_t base_frac16;      // 16-bit fractional (sdm1:sdm0)
+    uint16_t dev_frac16;       // ±deviation in the same units
     bool     is_rev0;
 } fm_apll_cfg_t;
 
