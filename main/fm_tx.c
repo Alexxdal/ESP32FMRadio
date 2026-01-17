@@ -134,6 +134,8 @@ void fm_route_to_pin(void)
     PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO0_U, FUNC_GPIO0_CLK_OUT1);   // abilita il mux IO-MUX
     REG_SET_FIELD(PIN_CTRL, CLK_OUT1, 0);                           // sorgente = I2S0 MCLK
     gpio_set_direction(GPIO_NUM_0, GPIO_MODE_OUTPUT);
+    // Set maximum drive capability for GPIO0 to increase transmission power
+    gpio_set_drive_capability(GPIO_NUM_0, GPIO_DRIVE_CAP_3);
 }
 
 void fm_i2s_init(void)

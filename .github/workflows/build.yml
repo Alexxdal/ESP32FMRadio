@@ -1,0 +1,29 @@
+name: Build ESP32 FM Radio
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Build project
+      uses: docker://espressif/idf:v5.5
+      with:
+        args: bash -c "idf.py fullclean && idf.py reconfigure && idf.py build"
+      
+    - name: Upload binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: esp32-fm-radio-binaries
+        path: |
+          build/*
+        retention-days: 30
