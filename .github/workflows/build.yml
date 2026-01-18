@@ -25,5 +25,7 @@ jobs:
       with:
         name: esp32-fm-radio-binaries
         path: |
-          build/*
+          build/*.bin
+          build/bootloader/*.bin
+          build/partition_table/*.bin
         retention-days: 30

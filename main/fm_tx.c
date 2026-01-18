@@ -28,10 +28,10 @@
 #include "esp_timer.h"
 #include "esp32/rom/rtc.h"
 #include <math.h>
+#include <stdio.h>
 #include "fm_tx.h"
-
-
-#include "rickroll.h"
+#include "wav_parser.h"
+#include "fm_wav.h"
 
 #define FM_CARRIER_HZ   100000000UL     // FM Carrier Frequency
 #define MAX_DEV_HZ      75000UL        // ±75 kHz standard broadcast
@@ -45,6 +45,7 @@
 static fm_apll_cfg_t fm_calc_apll(uint32_t fout_hz, uint32_t dev_hz);
 
 static fm_apll_cfg_t g_apll;
+static wav_file_t g_wav_file; // Global WAV file context
 
 static inline uint32_t get_xtal_hz(void)
 {
@@ -131,11 +132,13 @@ static inline void fm_set_deviation(int16_t delta_frac16)
 
 void fm_route_to_pin(void)
 {
-    PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO0_U, FUNC_GPIO0_CLK_OUT1);   // abilita il mux IO-MUX
-    REG_SET_FIELD(PIN_CTRL, CLK_OUT1, 0);                           // sorgente = I2S0 MCLK
-    gpio_set_direction(GPIO_NUM_0, GPIO_MODE_OUTPUT);
-    // Set maximum drive capability for GPIO0 to increase transmission power
-    gpio_set_drive_capability(GPIO_NUM_0, GPIO_DRIVE_CAP_3);
+    // Route I2S MCLK to WiFi antenna (GPIO16 - safe alternative pin)
+    // GPIO16 is a safe choice that won't interfere with boot process
+    PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO16_U, 3);  // Set GPIO16 to CLK_OUT1 function
+    REG_SET_FIELD(PIN_CTRL, CLK_OUT1, 0);         // Source = I2S0 MCLK
+    gpio_set_direction(GPIO_NUM_16, GPIO_MODE_OUTPUT);
+    // Set maximum drive capability for GPIO16 to increase transmission power
+    gpio_set_drive_capability(GPIO_NUM_16, GPIO_DRIVE_CAP_3);
 }
 
 void fm_i2s_init(void)
@@ -148,9 +151,9 @@ void fm_i2s_init(void)
         .communication_format = I2S_COMM_FORMAT_STAND_PCM_SHORT,   // qualunque, non trasmetti dati (correspond to I2S_COMM_FORMAT_PCM)
         .use_apll             = true,
         .fixed_mclk           = FM_CARRIER_HZ,
-        .dma_buf_count        = 4,
-        .dma_buf_len          = 64,
-        .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1
+        .dma_buf_count        = 8,     // Increase buffer count for more stable transmission
+        .dma_buf_len          = 128,   // Increase buffer length to reduce interrupt frequency
+        .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL2  // Higher priority interrupt for FM transmission
     };
     ESP_ERROR_CHECK(i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL));
     ESP_ERROR_CHECK(i2s_start(I2S_NUM_0));
@@ -164,17 +167,78 @@ static inline int16_t clip16(int32_t v){
 
 static void IRAM_ATTR fm_timer_cb(void *arg)
 {
-    static size_t  pos      = 0;
-    /* 1. Leggi campione 8-bit e portalo a signed */
-    int16_t audio = (int16_t)rickroll[pos++] - 128;   // –128 … +127
-    if (pos >= rickroll_len) pos = 0;
-    /* 3. Scala in frazione APLL e applica deviazione */
-    int16_t delta = (audio * g_apll.dev_frac16) >> 7;      // scale
+    int16_t audio;
+    /* 1. Read sample from WAV file */
+    if (!wav_read_sample(&g_wav_file, &audio)) {
+        // If error or end of file, reset to beginning
+        wav_reset(&g_wav_file);
+        wav_read_sample(&g_wav_file, &audio);
+    }
+    /* 2. Scale to APLL fraction and apply deviation */
+    int16_t delta = (audio * g_apll.dev_frac16) >> 15;      // scale for 16-bit audio
     fm_set_deviation(delta);
 }
 
 void fm_start_audio(void)
 {
+    // Open WAV file from memory
+    if (!wav_open_from_memory(fm_wav, fm_wav_len, &g_wav_file)) {
+        ESP_LOGE("FM", "Failed to open WAV file from memory");
+        return;
+    }
+    
+    // Check if sample rate matches
+    if (g_wav_file.fmt.sample_rate != WAV_SR_HZ) {
+        ESP_LOGE("FM", "WAV file sample rate (%d Hz) does not match expected (%d Hz)", 
+                 g_wav_file.fmt.sample_rate, WAV_SR_HZ);
+        wav_close(&g_wav_file);
+        return;
+    }
+    
+    ESP_LOGI("FM", "WAV file opened successfully from memory");
+    ESP_LOGI("FM", "Sample rate: %d Hz", g_wav_file.fmt.sample_rate);
+    ESP_LOGI("FM", "Channels: %d", g_wav_file.fmt.num_channels);
+    ESP_LOGI("FM", "Bits per sample: %d", g_wav_file.fmt.bits_per_sample);
+    ESP_LOGI("FM", "Data size: %d bytes", g_wav_file.data.subchunk2_size);
+    
+    // Start the audio timer
+    const esp_timer_create_args_t t = {
+        .callback = fm_timer_cb,
+        .name = "fm_audio"
+    };
+    esp_timer_handle_t h;
+    esp_timer_create(&t, &h);
+    esp_timer_start_periodic(h, 1000000ULL / WAV_SR_HZ);
+}
+
+void fm_start_audio_from_file(const char *filename)
+{
+    // Close any existing WAV file
+    if (g_wav_file.is_open) {
+        wav_close(&g_wav_file);
+    }
+    
+    // Open WAV file from filesystem
+    if (!wav_open(filename, &g_wav_file)) {
+        ESP_LOGE("FM", "Failed to open WAV file from filesystem: %s", filename);
+        return;
+    }
+    
+    // Check if sample rate matches
+    if (g_wav_file.fmt.sample_rate != WAV_SR_HZ) {
+        ESP_LOGE("FM", "WAV file sample rate (%d Hz) does not match expected (%d Hz)", 
+                 g_wav_file.fmt.sample_rate, WAV_SR_HZ);
+        wav_close(&g_wav_file);
+        return;
+    }
+    
+    ESP_LOGI("FM", "WAV file opened successfully from filesystem: %s", filename);
+    ESP_LOGI("FM", "Sample rate: %d Hz", g_wav_file.fmt.sample_rate);
+    ESP_LOGI("FM", "Channels: %d", g_wav_file.fmt.num_channels);
+    ESP_LOGI("FM", "Bits per sample: %d", g_wav_file.fmt.bits_per_sample);
+    ESP_LOGI("FM", "Data size: %d bytes", g_wav_file.data.subchunk2_size);
+    
+    // Start the audio timer
     const esp_timer_create_args_t t = {
         .callback = fm_timer_cb,
         .name = "fm_audio"

@@ -12,5 +12,6 @@ void fm_i2s_init(void);
 void fm_apll_init(void);
 void fm_route_to_pin(void);
 void fm_start_audio(void);
+void fm_start_audio_from_file(const char *filename);
 
 #endif // FM_TX_H
